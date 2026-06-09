@@ -1,0 +1,24 @@
+{
+  "name": "runscript",
+  "version": "1.0.0",
+  "description": "A reusable background-job runner for Claude Code agents — the CLI is the heartbeat, so the agent can never idle waiting on a job.",
+  "type": "module",
+  "bin": {
+    "runScript": "./runScript.ts"
+  },
+  "scripts": {
+    "demo": "bun runScript.ts start demo --eta 30s --parallel 'mapLimit 4 over 20 units' -- bun examples/demo.ts 20"
+  },
+  "files": [
+    "runScript.ts",
+    "helpers/",
+    "rules/",
+    "examples/",
+    "install.sh",
+    "CLAUDE.md"
+  ],
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "license": "MIT"
+}
