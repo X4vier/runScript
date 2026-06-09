@@ -19,8 +19,28 @@ import {
 import { spawn } from "node:child_process";
 import { join, resolve, dirname } from "node:path";
 
-const TICK_MAX_MS = 55_000; // every blocking call returns within this window
-const SAMPLE_EVERY_MS = 2_000; // how often tick reads progress during its wait
+// RUNSCRIPT_TIME_SCALE shrinks every wait (default 1). It exists ONLY to make the
+// adaptive-interval test suite run in seconds instead of minutes; never set it in
+// real use.
+const SCALE = (() => {
+  const v = Number(process.env.RUNSCRIPT_TIME_SCALE);
+  return Number.isFinite(v) && v > 0 ? v : 1;
+})();
+
+const BASE_WAIT_MS = 55_000 * SCALE; // first checks stay under a minute — the anti-idle floor
+const SAMPLE_EVERY_MS = Math.max(150, 2_000 * SCALE); // how often tick reads progress while waiting
+const ETA_BUFFER_MS = 15_000 * SCALE; // don't sleep much past the expected finish
+const STALL_MIN_MS = 120_000 * SCALE; // shortest "no new progress" window before flagging a stall
+
+// Adaptive poll ladder (ms), indexed by how many ticks already happened. A healthy,
+// steadily-progressing job widens along this ladder so a 40-minute job doesn't cost 40
+// agent turns. ANY anomaly (stall, over-estimate, no signal, exit) returns early and
+// snaps the next interval back to BASE. Cap = 16 minutes.
+const WAIT_LADDER_MS = [55_000, 55_000, 55_000, 120_000, 240_000, 480_000, 960_000].map(
+  (x) => x * SCALE,
+);
+const nextWaitMs = (tickCount: number) =>
+  WAIT_LADDER_MS[Math.min(tickCount, WAIT_LADDER_MS.length - 1)]!;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Durations
@@ -70,6 +90,10 @@ const PROJECT_ROOT = findProjectRoot();
 const RUNS_DIR = join(PROJECT_ROOT, ".runs");
 const runDir = (name: string) => join(RUNS_DIR, name);
 
+// Where the shipped helpers live, resolved relative to this CLI (works through the
+// ~/.local/bin symlink because Bun resolves the real path). Used by `runScript helper`.
+const HELPER_DIR = join(import.meta.dir, "helpers");
+
 interface Meta {
   name: string;
   pid: number;
@@ -87,6 +111,19 @@ const progressPath = (n: string) => join(runDir(n), "progress");
 const samplesPath = (n: string) => join(runDir(n), "samples.jsonl");
 const exitCodePath = (n: string) => join(runDir(n), "exit_code");
 const killedPath = (n: string) => join(runDir(n), "killed");
+const ticksPath = (n: string) => join(runDir(n), "ticks");
+
+function readTickCount(name: string): number {
+  try {
+    const n = parseInt(readFileSync(ticksPath(name), "utf8").trim(), 10);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+function writeTickCount(name: string, n: number): void {
+  writeFileSync(ticksPath(name), String(n));
+}
 
 function readMeta(name: string): Meta | null {
   const p = metaPath(name);
@@ -222,6 +259,34 @@ function computeRateEta(samples: Sample[]): RateEta {
   return { rate, etaSecs: rate > 0 ? remaining / rate : null, done, total };
 }
 
+interface StallInfo {
+  stalled: boolean;
+  ageMs: number; // time since the last progress *change*
+  thresholdMs: number;
+}
+
+/**
+ * A job is "stalled" if it's still running but `done` hasn't advanced for longer
+ * than we'd expect from its own recent cadence. Threshold adapts: a job that ticks
+ * every 2s trips fast; one that ticks every 5min is given proportionally longer.
+ * Samples are only written on change, so the newest sample's age IS the idle time.
+ */
+function stallInfo(samples: Sample[], now: number, state: State): StallInfo {
+  const last = samples[samples.length - 1];
+  if (!last || state !== "running") return { stalled: false, ageMs: 0, thresholdMs: 0 };
+  const finishing = last.total > 0 && last.done >= last.total; // reached total, just finalizing
+  const ageMs = now - last.t;
+  const recent = samples.slice(-6);
+  let typical = 0;
+  if (recent.length >= 2) {
+    let sum = 0;
+    for (let i = 1; i < recent.length; i++) sum += recent[i]!.t - recent[i - 1]!.t;
+    typical = sum / (recent.length - 1);
+  }
+  const thresholdMs = Math.max(STALL_MIN_MS, typical * 4);
+  return { stalled: !finishing && ageMs > thresholdMs, ageMs, thresholdMs };
+}
+
 type State = "running" | "done" | "failed" | "killed";
 
 function jobState(name: string, meta: Meta): { state: State; exitCode: number | null } {
@@ -258,6 +323,8 @@ interface Snapshot {
   progressMsg: string | null;
   noProgressSignal: boolean;
   overEta: boolean;
+  stalled: boolean;
+  stallAgeSecs: number;
   errTail: string[];
 }
 
@@ -270,6 +337,7 @@ function snapshot(name: string, meta: Meta, now: number): Snapshot {
   const hasSignal = samples.length > 0 || (prog != null && prog.raw.length > 0);
   const pct =
     re.total > 0 && Number.isFinite(re.done) ? Math.round((re.done / re.total) * 100) : null;
+  const stall = stallInfo(samples, now, state);
 
   return {
     name,
@@ -284,6 +352,8 @@ function snapshot(name: string, meta: Meta, now: number): Snapshot {
     progressMsg: prog?.message || null,
     noProgressSignal: !hasSignal && state === "running",
     overEta: state === "running" && re.etaSecs != null && elapsedSecs + re.etaSecs > meta.eta * 1.5,
+    stalled: stall.stalled,
+    stallAgeSecs: stall.ageMs / 1000,
     errTail: tailLines(errPath(name), 4),
   };
 }
@@ -329,6 +399,13 @@ function renderSnapshot(s: Snapshot, meta: Meta): string {
         meta.eta,
       )} estimate. Consider \`runScript stop ${s.name}\` and reassess.`,
     );
+  }
+  if (s.stalled) {
+    L.push("");
+    L.push(
+      `  ⚠ STALLED — no new progress for ${fmtDuration(s.stallAgeSecs)} while still running.`,
+    );
+    L.push("    Could be one slow unit or a hang. If it persists another cycle, stop and investigate.");
   }
   if ((s.state === "failed" || s.state === "killed") && s.errTail.length) {
     L.push("");
@@ -415,7 +492,13 @@ function cmdStart(argv: string[]): number {
   // Fresh run-state, but PRESERVE *.checkpoint.json so re-start resumes.
   // These must be DELETED, not truncated: jobState() keys off existsSync, so a
   // lingering empty `killed`/`exit_code` would mis-report a live run as dead.
-  for (const p of [exitCodePath(a.name), killedPath(a.name), samplesPath(a.name), progressPath(a.name)]) {
+  for (const p of [
+    exitCodePath(a.name),
+    killedPath(a.name),
+    samplesPath(a.name),
+    progressPath(a.name),
+    ticksPath(a.name),
+  ]) {
     if (existsSync(p)) {
       try {
         rmSync(p);
@@ -513,16 +596,33 @@ async function cmdTick(argv: string[]): Promise<number> {
     return 2;
   }
 
-  const deadline = Date.now() + TICK_MAX_MS;
+  const tickCount = readTickCount(name);
+  const start = Date.now();
+  maybeSample(name, start);
+  const entry = snapshot(name, meta, start);
+
+  // How long THIS tick may block. Widen along the ladder only for a healthy,
+  // progressing job; otherwise stay tight (BASE). Never sleep much past the
+  // expected finish. Floor so we don't busy-spin.
+  const healthy =
+    entry.state === "running" && !entry.noProgressSignal && !entry.overEta && !entry.stalled;
+  let budgetMs = nextWaitMs(tickCount);
+  if (!healthy) budgetMs = Math.min(budgetMs, BASE_WAIT_MS);
+  if (entry.etaSecs != null && Number.isFinite(entry.etaSecs)) {
+    budgetMs = Math.min(budgetMs, entry.etaSecs * 1000 + ETA_BUFFER_MS);
+  }
+  budgetMs = Math.max(budgetMs, 8_000 * SCALE);
+
+  const stalledAtEntry = entry.stalled;
+  const deadline = start + budgetMs;
   while (Date.now() < deadline) {
     const now = Date.now();
-    maybeSample(name, now);
-
+    const samples = maybeSample(name, now);
     if (enforceMax(name, meta, now)) break;
-
-    const { state } = jobState(name, meta);
-    if (state !== "running") break;
-
+    if (jobState(name, meta).state !== "running") break;
+    // A stall that DEVELOPS mid-wait → return early so the agent reacts promptly.
+    // (A pre-existing stall just rides out the BASE wait, so we don't hot-loop.)
+    if (!stalledAtEntry && stallInfo(samples, now, "running").stalled) break;
     await Bun.sleep(SAMPLE_EVERY_MS);
   }
 
@@ -530,6 +630,35 @@ async function cmdTick(argv: string[]): Promise<number> {
   maybeSample(name, now);
   const snap = snapshot(name, meta, now);
   console.log(renderSnapshot(snap, meta));
+
+  // Self-teaching footer: the most reliable docs are the ones the agent sees at the
+  // moment of action. Always say what to run next; explain when a long wait is by
+  // design so no one mistakes it for a hang.
+  if (snap.state === "running") {
+    writeTickCount(name, tickCount + 1);
+    const stillHealthy = !snap.noProgressSignal && !snap.overEta && !snap.stalled;
+    const upcoming = stillHealthy ? nextWaitMs(tickCount + 1) : BASE_WAIT_MS;
+    console.log("");
+    if (stillHealthy && upcoming > BASE_WAIT_MS) {
+      console.log(`  ⏱ Healthy through ${tickCount + 1} checks — widening the poll interval.`);
+      console.log(
+        `     Next \`runScript tick ${name}\` may block up to ${fmtDuration(
+          upcoming / 1000,
+        )} (intentional — not a hang). It returns early the instant the job`,
+      );
+      console.log(`     finishes, stalls, or slips past ETA.`);
+      console.log(
+        `     → Tell the user you're now checking every ~${fmtDuration(
+          upcoming / 1000,
+        )}, then run: runScript tick ${name}`,
+      );
+    } else {
+      console.log(`  → Next: runScript tick ${name}   (blocks until exit or ~${fmtDuration(upcoming / 1000)})`);
+    }
+  } else {
+    console.log("");
+    console.log(`  ✔ Finished (${snap.state}) — no more ticks needed.`);
+  }
   return snap.state === "running" || snap.state === "done" ? 0 : 1;
 }
 
@@ -631,19 +760,59 @@ function cmdLogs(argv: string[]): number {
   return 0;
 }
 
+function cmdHelper(argv: string[]): number {
+  const lang = argv[0];
+  const files: Record<string, string> = {
+    ts: "runScript.ts",
+    sh: "runScript.sh",
+    py: "runScript.py",
+  };
+  const fname = lang ? files[lang] : undefined;
+  if (!fname) {
+    console.error("usage: runScript helper <ts|sh|py> [--out <path>]");
+    console.error("  Prints (or writes) the progress/checkpoint helper so a script in ANY");
+    console.error("  project can import it locally — e.g.:");
+    console.error("    runScript helper ts --out scripts/runscript.ts");
+    return 2;
+  }
+  const src = join(HELPER_DIR, fname);
+  if (!existsSync(src)) {
+    console.error(`helper not found at ${src} (is the runScript repo intact?)`);
+    return 1;
+  }
+  const body = readFileSync(src, "utf8");
+  const outIdx = argv.findIndex((a) => a === "--out");
+  const out = outIdx >= 0 ? argv[outIdx + 1] : undefined;
+  if (out) {
+    mkdirSync(dirname(resolve(out)), { recursive: true });
+    writeFileSync(out, body);
+    console.log(`Wrote ${lang} helper → ${out}`);
+    if (lang === "ts") {
+      const spec = out.startsWith("/") || out.startsWith("./") || out.startsWith("../") ? out : `./${out}`;
+      console.log(`Import it: import { progress, mapLimit, checkpoint } from "${spec}";`);
+    }
+  } else {
+    process.stdout.write(body);
+  }
+  return 0;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 const HELP = `runScript — background-job runner with a built-in heartbeat.
 
   runScript start <name> --eta <dur> --parallel "<how>" [--max <dur>] -- <command...>
-  runScript tick   <name>     blocks until exit OR ~55s, then prints a snapshot
+  runScript tick   <name>     blocks until exit OR the poll interval, then a snapshot
   runScript status <name>     non-blocking snapshot
   runScript stop   <name>     kill the detached job (checkpoint preserved)
   runScript list              runs in this project + status
   runScript logs   <name> [--out|--err|--progress]
+  runScript helper <ts|sh|py> [--out <path>]   scaffold the progress/checkpoint helper
 
 Durations: 90s, 8m, 1h (bare number = seconds).
-Loop:  start once → tick repeatedly (each ≤55s) → relay %/rate/ETA each cycle → stop when done.`;
+Loop:  start once → tick repeatedly → relay %/rate/ETA each cycle → stop when done.
+Poll interval starts at ~55s and widens (2m→4m→8m→16m) only while the job stays
+healthy; it returns early the instant the job exits, stalls, or slips past ETA.`;
 
 async function main(): Promise<number> {
   const [cmd, ...rest] = process.argv.slice(2);
@@ -660,6 +829,8 @@ async function main(): Promise<number> {
       return cmdList();
     case "logs":
       return cmdLogs(rest);
+    case "helper":
+      return cmdHelper(rest);
     case "help":
     case "--help":
     case "-h":

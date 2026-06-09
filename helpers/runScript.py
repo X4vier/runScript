@@ -1,7 +1,10 @@
-"""runScript Python helper.
+"""runScript Python helper — the ESCAPE HATCH, not a peer of the TS helper.
 
-Use Python ONLY when an essential library is Python-only — otherwise prefer the
-TypeScript helper (Bun + Prisma, type-safe, good concurrency).
+Default to TypeScript on Bun for scripts. Use Python ONLY when an essential library
+exists only in Python (a specific ML/scientific package with no JS equivalent) — not
+because Python feels more familiar. This file exists so that, when you genuinely must
+use Python, the script still emits progress in the engine's format and checkpoints
+correctly instead of being hand-rolled.
 
 Emit progress as a single OVERWRITTEN line "<done> <total> <message>" to the file
 runScript injects at $RUNSCRIPT_PROGRESS. Falls back to a local .progress/ dir
