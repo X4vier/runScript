@@ -33,6 +33,9 @@ Before running anything, state an expected wall-clock time. Threshold = **1 minu
 - **> 1 min:** you MUST go through `runScript`:
   1. `runScript start <name> --eta <est> --parallel "<how>" -- <command>`
      — it **refuses** without `--eta` and `--parallel`. Declare both every time.
+     **A rough first `--eta` is fine** — don't stall measuring throughput up front. The
+     first `tick` recomputes the ETA from real progress within ~55s; correct yourself to
+     the user then. Guess, then refine.
   2. Loop `runScript tick <name>` until it prints `Finished`. Each call blocks until the
      job exits or the current poll interval, then prints a snapshot **and a footer telling
      you the exact next command** — follow it.
